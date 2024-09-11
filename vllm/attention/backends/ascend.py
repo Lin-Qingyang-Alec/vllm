@@ -16,8 +16,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadataBuilder)
 from vllm.attention.backends.utils import (PAD_SLOT_ID, compute_slot_mapping,
                                            compute_slot_mapping_start_idx,
-                                           is_block_tables_empty)
-from vllm.attention.ops.paged_attn import PagedAttention
+                                           is_block_tables_empty, CommonMetadataBuilder)
+from vllm.attention.ops.paged_attn import PagedAttention, PagedAttentionMetadata
 
 if TYPE_CHECKING:
     from vllm.worker.npu_model_runner import ModelInputForNPUBuilder
@@ -127,9 +127,8 @@ class AscendPagedAttention(PagedAttention):
         value_cache: torch.Tensor,
         slot_indices: torch.Tensor,
     ) -> None:
-        batch_size, seq_len, slot_dim = slot_indices.shape
-        key = key.view(batch_size, seq_len, key_cache.shape[-1])
-        value = value.view(batch_size, seq_len, value_cache.shape[-1])
+        key = key.view(-1, key_cache.shape[-1])
+        value = value.view(-1, value_cache.shape[-1])
         torch_npu.npu_scatter_nd_update_(key_cache, slot_indices, key)
         torch_npu.npu_scatter_nd_update_(value_cache, slot_indices, value)
 
@@ -194,6 +193,10 @@ class AscendMetadata(AttentionMetadata, PagedAttentionMetadata):
     # and block tables
     cross_slot_mapping: Optional[torch.Tensor] = None
     cross_block_tables: Optional[torch.Tensor] = None
+
+    attn_mask: torch.Tensor = None
+    pse_shift: torch.Tensor = None
+    sparse_mode: int = 0
 
     def __post_init__(self):
         # Set during the execution of the first attention op.
@@ -326,7 +329,7 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
         computed_block_nums = inter_data.computed_block_nums
-        max_query_len = max(inter_data.query_lens)
+        max_query_len = max(max(inter_data.query_lens) for inter_data in self.input_builder.inter_data_list)
 
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
              curr_sliding_window_block) in zip(
@@ -440,9 +443,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if kv_cache is not None:
             if attn_metadata.num_prefills > 0:
-                slot_indices = attn_metadata.prefill_metadata.slot_indices
+                slot_indices = attn_metadata.prefill_metadata.slot_mapping
             else:
-                slot_indices = attn_metadata.decode_metadata.slot_indices
+                slot_indices = attn_metadata.decode_metadata.slot_mapping
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             AscendPagedAttention.write_to_paged_cache(
                 key,
